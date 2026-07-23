@@ -1,0 +1,12 @@
+{
+  "name": "tomori-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "monitor.mjs",
+  "scripts": {
+    "start": "node monitor.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
