@@ -96,7 +96,14 @@ async function collectMetrics() {
   const subtitleCandidates = new Set(cands.map(function (x) { return x.video_id; })).size;
   const subtitleRemaining = Math.max(0, subtitleCandidates - subtitleDone);
 
+  const unedited = await fetchAll("transcripts", {
+    select: "video_id",
+    apply: function (q) { return q.eq("lang", "ja").is("edited_text", null); },
+  });
+  const uneditedCount = new Set(unedited.map(function (x) { return x.video_id; })).size;
+
   return {
+    uneditedCount: uneditedCount,
     transcriptDone: transcriptDone,
     transcriptRemaining: transcriptRemaining,
     transcriptStatus: vc,
@@ -248,6 +255,33 @@ async function check(name, done, remaining, healFn, serviceId, metrics) {
   return "alerted(通知済)";
 }
 
+const UNEDITED_STALL_MS = 30 * 60 * 1000;
+
+async function checkUnedited(m) {
+  const now = Date.now();
+  const prev = await getState("unedited_watch");
+  if (prev === null || m.uneditedCount <= prev.count) {
+    await setState("unedited_watch", { count: m.uneditedCount, since: now, notified: false });
+    return "正常";
+  }
+  const since = prev.since || now;
+  const elapsed = now - since;
+  if (elapsed >= UNEDITED_STALL_MS && prev.notified !== true) {
+    await sendAlert(
+      "整形が退避状態のままです",
+      "未整形の本数が増え続けています。\n\n" +
+      "前回 " + prev.count + "本 → 今回 " + m.uneditedCount + "本\n" +
+      "継続時間 " + Math.round(elapsed / 60000) + "分\n\n" +
+      "Anthropic APIが上限またはレート制限に達している可能性があります。\n" +
+      "復旧後は backfill-edit.mjs で後追い整形してください。"
+    );
+    await setState("unedited_watch", { count: m.uneditedCount, since: since, notified: true });
+    return "通知済み";
+  }
+  await setState("unedited_watch", { count: m.uneditedCount, since: since, notified: prev.notified === true });
+  return "増加中" + Math.round(elapsed / 60000) + "分";
+}
+
 async function tick() {
   try {
     const m = await collectMetrics();
@@ -270,10 +304,13 @@ async function tick() {
       m
     );
 
+    const ue = await checkUnedited(m);
+
     console.log(
       new Date().toISOString() +
       " | 文字起こし " + m.transcriptDone + " 残" + m.transcriptRemaining + " (" + tr + ")" +
-      " | 字幕 " + m.subtitleDone + "/" + m.subtitleCandidates + " (" + sb + ")"
+      " | 字幕 " + m.subtitleDone + "/" + m.subtitleCandidates + " (" + sb + ")" +
+      " | 未整形 " + m.uneditedCount + " (" + ue + ")"
     );
   } catch (e) {
     console.error("監視エラー:", e.message);
