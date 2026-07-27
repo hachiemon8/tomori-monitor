@@ -13,7 +13,7 @@ const ALERT_TO = process.env.ALERT_TO || "hachiemon8@gmail.com";
 const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || "";
 const RAILWAY_WORKER_SERVICE_ID = process.env.RAILWAY_WORKER_SERVICE_ID || "";
 const RAILWAY_SUBTITLE_SERVICE_ID = process.env.RAILWAY_SUBTITLE_SERVICE_ID || "";
-const RAILWAY_ENVIRONMENT_ID = process.env.RAILWAY_ENVIRONMENT_ID || "";
+const RAILWAY_ENVIRONMENT_ID = process.env.TARGET_ENVIRONMENT_ID || process.env.RAILWAY_ENVIRONMENT_ID || "";
 
 async function sendAlert(subject, body) {
   if (!process.env.RESEND_API_KEY) {
@@ -102,7 +102,14 @@ async function collectMetrics() {
   });
   const uneditedCount = new Set(unedited.map(function (x) { return x.video_id; })).size;
 
+  const noseg = await fetchAll("transcripts", {
+    select: "video_id",
+    apply: function (q) { return q.eq("lang", "ja").is("segments", null).not("edited_text", "is", null); },
+  });
+  const noSegCount = new Set(noseg.map(function (x) { return x.video_id; })).size;
+
   return {
+    noSegCount: noSegCount,
     uneditedCount: uneditedCount,
     transcriptDone: transcriptDone,
     transcriptRemaining: transcriptRemaining,
@@ -255,6 +262,41 @@ async function check(name, done, remaining, healFn, serviceId, metrics) {
   return "alerted(通知済)";
 }
 
+const RESEG_STALL_MS = 30 * 60 * 1000;
+
+async function checkResegment(m) {
+  const now = Date.now();
+  if (m.noSegCount === 0) return "完了";
+  if (m.transcriptRemaining > 0) return "待機";
+  const prev = await getState("reseg_watch");
+  if (prev === null || m.noSegCount < prev.count) {
+    await setState("reseg_watch", { count: m.noSegCount, since: now, notified: false, restarted: false });
+    return "進行中";
+  }
+  const since = prev.since || now;
+  const elapsed = now - since;
+  if (elapsed >= RESEG_STALL_MS && prev.notified !== true) {
+    if (prev.restarted !== true) {
+      const ok = await restartRailwayService(RAILWAY_WORKER_SERVICE_ID, "tomori-worker");
+      await setState("reseg_watch", { count: m.noSegCount, since: now, notified: false, restarted: true });
+      return ok ? "再起動しました" : "再起動失敗";
+    }
+    await sendAlert(
+      "音声の再取得が止まっています",
+      "segments が無い動画の本数が減っていません。<br><br>" +
+      "残り " + m.noSegCount + "本<br>" +
+      "停滞 " + Math.round(elapsed / 60000) + "分<br><br>" +
+      "文字起こしの未処理は0なので、本来は再取得が動いているはずです。<br>" +
+      "Railwayの tomori-worker で、一覧のいちばん上（ACTIVE）の View logs を開いてください。<br>" +
+      "ログが1行も出ていなければコンテナが無言で停止しています。Redeploy で復旧します。"
+    );
+    await setState("reseg_watch", { count: m.noSegCount, since: since, notified: true, restarted: true });
+    return "通知済み";
+  }
+  await setState("reseg_watch", { count: m.noSegCount, since: since, notified: prev.notified === true, restarted: prev.restarted === true });
+  return "停滞" + Math.round(elapsed / 60000) + "分";
+}
+
 const UNEDITED_STALL_MS = 30 * 60 * 1000;
 
 async function checkUnedited(m) {
@@ -305,12 +347,14 @@ async function tick() {
     );
 
     const ue = await checkUnedited(m);
+    const rs = await checkResegment(m);
 
     console.log(
       new Date().toISOString() +
       " | 文字起こし " + m.transcriptDone + " 残" + m.transcriptRemaining + " (" + tr + ")" +
       " | 字幕 " + m.subtitleDone + "/" + m.subtitleCandidates + " (" + sb + ")" +
-      " | 未整形 " + m.uneditedCount + " (" + ue + ")"
+      " | 未整形 " + m.uneditedCount + " (" + ue + ")" +
+      " | 再取得残 " + m.noSegCount + " (" + rs + ")"
     );
   } catch (e) {
     console.error("監視エラー:", e.message);
